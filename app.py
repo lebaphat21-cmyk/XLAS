@@ -1,445 +1,162 @@
+"""XLAS: giao diện riêng, kế thừa pipeline từ web_demo.py."""
+import argparse
 import os
-import streamlit as st
-import cv2
-import numpy as np
-import torch
-from PIL import Image
-import matplotlib.pyplot as plt
-import yaml
-import pickle
+from pathlib import Path
 
-from src.models import RGBFrequencyFusionModel, SpatioTemporalVideoModel, extract_fft_features_for_svm
-from src.preprocessing import detect_and_crop_face, compute_fft, extract_video_frames
-from src.dataset import get_transforms
-from src.explain import GradCAM, generate_cam_overlay
-# python -m streamlit run app.py
-# Thiết lập trang Streamlit
-st.set_page_config(
-    page_title="AI Fake Content Detector",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import gradio as gr
+import backend
 
-# Injected Custom CSS for Premium Design (Dark Mode, Glassmorphism, Neon glow)
-st.markdown("""
-<style>
-    /* Import font Inter */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
-    }
-    
-    /* Thiết kế Header Gradient cực đẹp */
-    .header-container {
-        background: linear-gradient(135deg, #1e0034 0%, #0d001a 100%);
-        padding: 2.5rem;
-        border-radius: 16px;
-        margin-bottom: 2rem;
-        border: 1px solid #3c0068;
-        box-shadow: 0 8px 32px 0 rgba(107, 0, 179, 0.2);
-        text-align: center;
-    }
-    
-    .header-title {
-        color: #ffffff;
-        font-size: 3rem;
-        font-weight: 800;
-        margin-bottom: 0.5rem;
-        letter-spacing: -1px;
-        background: linear-gradient(to right, #00f2fe, #4facfe, #b92b27);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    
-    .header-subtitle {
-        color: #b3b3b3;
-        font-size: 1.2rem;
-        font-weight: 300;
-    }
-    
-    /* Thiết kế thẻ Card Glassmorphism */
-    .metric-card {
-        background: rgba(255, 255, 255, 0.03);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.05);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-bottom: 1rem;
-        transition: transform 0.3s ease, border 0.3s ease;
-    }
-    
-    .metric-card:hover {
-        transform: translateY(-5px);
-        border: 1px solid rgba(0, 242, 254, 0.3);
-    }
-    
-    .metric-title {
-        color: #b3b3b3;
-        font-size: 0.9rem;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        margin-bottom: 0.5rem;
-    }
-    
-    .metric-value {
-        color: #ffffff;
-        font-size: 2rem;
-        font-weight: 700;
-    }
-    
-    /* Phân biệt nhãn Real/Fake bằng màu Neon */
-    .badge-real {
-        background-color: rgba(0, 230, 115, 0.15);
-        color: #00e673;
-        padding: 0.4rem 1rem;
-        border-radius: 50px;
-        font-weight: 600;
-        border: 1px solid rgba(0, 230, 115, 0.3);
-        display: inline-block;
-    }
-    
-    .badge-fake {
-        background-color: rgba(255, 77, 77, 0.15);
-        color: #ff4d4d;
-        padding: 0.4rem 1rem;
-        border-radius: 50px;
-        font-weight: 600;
-        border: 1px solid rgba(255, 77, 77, 0.3);
-        display: inline-block;
-    }
-</style>
-""", unsafe_allow_html=True)
+ROOT = Path(__file__).resolve().parent.parent
+XLAS_DIR = Path(__file__).resolve().parent
+css_path = XLAS_DIR / "styles.css"
+CSS = css_path.read_text(encoding="utf-8") if css_path.is_file() else ""
+SAMPLES_DIR = XLAS_DIR / "data" / "samples"
+SAMPLE_IMAGES = sorted([str(p) for p in SAMPLES_DIR.glob("*.jpg")]) if SAMPLES_DIR.exists() else []
 
-# Đọc cấu hình
-def load_config():
-    config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config.yaml')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
 
-config = load_config()
-IMAGE_SIZE = tuple(config['preprocessing']['image_size'])
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def make_theme():
+    theme = gr.themes.Soft(primary_hue="teal", neutral_hue="slate", font=["Segoe UI", "Arial", "sans-serif"])
+    theme.set(body_background_fill="#f3f6fa", block_background_fill="#ffffff",
+              body_text_color="#15263d", body_text_color_subdued="#53657b",
+              block_border_color="#e0e7ef", input_background_fill="#f8fafc",
+              button_primary_background_fill="#087f75", button_primary_text_color="#ffffff",
+              button_primary_background_fill_hover="#06685f")
+    # Giữ bảng màu sáng nhất quán cả khi trình duyệt đang bật dark mode.
+    values = theme.to_dict()["theme"]
+    theme.set(**{key: values[key[:-5]] for key in values if key.endswith("_dark") and key[:-5] in values})
+    return theme
 
-# Tiêu đề ứng dụng
-st.markdown("""
-<div class="header-container">
-    <div class="header-title">🛡️ AI FAKE CONTENT DETECTOR</div>
-    <div class="header-subtitle">Hệ thống phân cấp phát hiện nội dung giả mạo bằng phân tích Không gian, Tần số và Thời gian</div>
-</div>
-""", unsafe_allow_html=True)
 
-# Tải mô hình
-@st.cache_resource
-def load_models():
-    models_dict = {'svm': None, 'image': None, 'video': None}
-    
-    # 1. Load SVM
-    svm_path = 'checkpoints/svm_baseline.pkl'
-    if os.path.exists(svm_path):
-        with open(svm_path, 'rb') as f:
-            models_dict['svm'] = pickle.load(f)
-            
-    # 2. Load Image Fusion Model
-    img_path = 'checkpoints/best_image_fusion.pth'
-    if os.path.exists(img_path):
-        # Inference loads every weight from our checkpoint, so avoid a needless
-        # EfficientNet download and keep the web app fully usable offline.
-        img_model = RGBFrequencyFusionModel(
-            num_classes=config['model']['num_classes'],
-            pretrained=False,
-        )
-        img_model.load_state_dict(torch.load(img_path, map_location='cpu'))
-        img_model.to(device)
-        img_model.eval()
-        models_dict['image'] = img_model
-        
-    # 3. Load Video Model
-    vid_path = 'checkpoints/best_video_temporal.pth'
-    if os.path.exists(vid_path) and models_dict['image'] is not None:
-        vid_model = SpatioTemporalVideoModel(image_model=models_dict['image'], num_classes=config['model']['num_classes'])
-        vid_model.load_state_dict(torch.load(vid_path, map_location='cpu'))
-        vid_model.to(device)
-        vid_model.eval()
-        models_dict['video'] = vid_model
-        
-    return models_dict
+def answer_question(image, text, audio, provider, gemini_key, openai_key):
+    if image is None or not (text or audio):
+        return backend.run_qa_assistant(image, text, audio, provider, gemini_key, openai_key)
+    if provider != "Demo cục bộ":
+        key = gemini_key if provider == "Gemini AI" else openai_key
+        if not key or not key.strip():
+            return "", "Vui lòng nhập API key của AI đã chọn trong Kết nối AI.", None
+    result = backend.run_qa_assistant(image, text, audio, provider, gemini_key, openai_key)
+    if provider == "Demo cục bộ":
+        return result[0], "[Demo mô phỏng — không phải câu trả lời AI đã xác minh]\n" + result[1], result[2]
+    return result
 
-models_loaded = load_models()
 
-# Sidebar cấu hình
-st.sidebar.markdown("### ⚙️ CẤU HÌNH HỆ THỐNG")
-threshold = st.sidebar.slider("Ngưỡng phân loại Fake (Threshold)", 0.0, 1.0, 0.5, 0.05)
+def panel_heading(number, title, subtitle):
+    gr.HTML(f'<div class="panel-heading"><span class="step">{number}</span><div><h3>{title}</h3><p>{subtitle}</p></div></div>')
 
-st.sidebar.markdown("### 📊 TRẠNG THÁI MÔ HÌNH")
-def show_status(name, is_loaded):
-    if is_loaded:
-        st.sidebar.markdown(f"🟢 **{name}**: Đã sẵn sàng")
-    else:
-        st.sidebar.markdown(f"🔴 **{name}**: Chưa tìm thấy checkpoint (Sử dụng ngẫu nhiên)")
 
-show_status("FFT + SVM Baseline", models_loaded['svm'] is not None)
-show_status("RGB-Frequency Fusion (Ảnh)", models_loaded['image'] is not None)
-show_status("Spatio-Temporal Model (Video)", models_loaded['video'] is not None)
+def section_heading(tag, title, description):
+    gr.HTML(f'<div class="section-heading"><span class="section-tag">{tag}</span><h2>{title}</h2><p>{description}</p></div>')
 
-# Thiết lập Tab
-tab_img, tab_vid = st.tabs(["🖼️ PHÂN TÍCH ẢNH", "🎥 PHÂN TÍCH VIDEO"])
 
-# ==========================================
-# TAB 1: PHÂN TÍCH ẢNH
-# ==========================================
-with tab_img:
-    st.markdown("### Phân tích đặc trưng không gian và miền tần số trên ảnh")
-    img_file = st.file_uploader("Tải lên ảnh của bạn (JPG, PNG, JPEG)", type=['jpg', 'jpeg', 'png'])
-    
-    if img_file is not None:
-        # Load image
-        file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        
-        # Tiền xử lý: resize trực tiếp về 224x224 (khớp với pipeline training CIFAKE)
-        # Lưu ý: model được train trên CIFAKE (ảnh chung) nên KHÔNG dùng face detection
-        proc_img = cv2.resize(img_bgr, IMAGE_SIZE, interpolation=cv2.INTER_AREA)
-        fft_arr = compute_fft(proc_img)
-        
-        # Bố cục hiển thị ảnh
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), caption="Ảnh tải lên gốc", use_container_width=True)
-            
-        with col2:
-            st.image(cv2.cvtColor(proc_img, cv2.COLOR_BGR2RGB), caption=f"Ảnh đã resize ({IMAGE_SIZE[0]}x{IMAGE_SIZE[1]})", use_container_width=True)
-            
-        with col3:
-            # Hiển thị phổ tần số FFT
-            fig_fft, ax_fft = plt.subplots(figsize=(4, 4))
-            ax_fft.imshow(fft_arr, cmap='gray')
-            ax_fft.axis('off')
-            st.pyplot(fig_fft, use_container_width=True)
-            plt.close(fig_fft)
-            st.markdown("<p style='text-align: center; color: #b3b3b3; font-size: 0.8rem;'>Phổ tần số Log-Amplitude</p>", unsafe_allow_html=True)
-            
-        # CHẠY SUY LUẬN
-        st.markdown("---")
-        st.markdown("### 🧠 Kết quả phân tích mô hình")
-        
-        # 1. Kết quả mô hình Fusion ảnh
-        st.markdown("#### Mô hình Đề xuất: RGB-Frequency Fusion")
-        
-        if models_loaded['image'] is not None:
-            # Chuẩn bị tensor (dùng proc_img đã resize, không phải face crop)
-            transform = get_transforms(split='test')
-            proc_pil = Image.fromarray(cv2.cvtColor(proc_img, cv2.COLOR_BGR2RGB))
-            rgb_tensor = transform(proc_pil).unsqueeze(0).to(device)
-            fft_tensor = torch.tensor(fft_arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
-            
-            # Khởi chạy Grad-CAM
-            target_layer = models_loaded['image'].spatial_branch.backbone.features[-1]
-            grad_cam = GradCAM(models_loaded['image'], target_layer)
-            
-            rgb_tensor.requires_grad = True
-            cam_mask, logits = grad_cam(rgb_tensor, fft_tensor)
-            
-            probs = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
-            fake_prob = probs[1]
-            
-            # Xử lý nhãn và màu sắc
-            if fake_prob >= threshold:
-                label_html = f'<span class="badge-fake">GIẢ MẠO (FAKE) - {fake_prob*100:.2f}%</span>'
-            else:
-                label_html = f'<span class="badge-real">THẬT (REAL) - {(1-fake_prob)*100:.2f}%</span>'
-                
-            st.markdown(f"<h5>Trạng thái nhận diện: {label_html}</h5>", unsafe_allow_html=True)
-            st.caption(f"📊 Xác suất REAL: {(1-fake_prob)*100:.1f}% | FAKE: {fake_prob*100:.1f}% | Ngưỡng: {threshold:.2f}")
-            
-            # Hiển thị Grad-CAM
-            overlay = generate_cam_overlay(proc_img, cam_mask)
-            
-            col_res1, col_res2 = st.columns(2)
-            with col_res1:
-                st.image(overlay, caption="Bản đồ nhiệt Grad-CAM (Vùng đáng ngờ)", use_container_width=True)
-            with col_res2:
-                # Vẽ biểu đồ cột phân bố xác suất
-                fig_bar, ax_bar = plt.subplots(figsize=(6, 3))
-                colors = ['#00e673', '#ff4d4d']
-                bars = ax_bar.barh(['Thật (Real)', 'Giả mạo (Fake)'], [1 - fake_prob, fake_prob], color=colors)
-                ax_bar.set_xlim(0, 1)
-                ax_bar.axvline(x=threshold, color='yellow', linestyle='--', label=f'Ngưỡng ({threshold:.2f})')
-                ax_bar.set_xlabel('Xác suất (Probability)')
-                ax_bar.legend(fontsize=8)
-                st.pyplot(fig_bar, use_container_width=True)
-                plt.close(fig_bar)
-                
-            grad_cam.remove_hooks()
-        else:
-            st.warning("⚠️ Chưa nạp mô hình ảnh Fusion thực tế. Đang hiển thị kết quả ngẫu nhiên do thiếu checkpoints.")
-            
-        # 2. Kết quả mô hình SVM Baseline
-        st.markdown("#### Mô hình Baseline: FFT + SVM")
-        if models_loaded['svm'] is not None:
-            svm_feats = extract_fft_features_for_svm(fft_arr).reshape(1, -1)
-            svm_probs = models_loaded['svm'].predict_proba(svm_feats)[0]
-            svm_fake_prob = svm_probs[1]
-            
-            if svm_fake_prob >= threshold:
-                svm_label = f'<span class="badge-fake">GIẢ MẠO (FAKE) - {svm_fake_prob*100:.2f}%</span>'
-            else:
-                svm_label = f'<span class="badge-real">THẬT (REAL) - {(1-svm_fake_prob)*100:.2f}%</span>'
-            st.markdown(f"Trạng thái (SVM): {svm_label}", unsafe_allow_html=True)
-        else:
-            st.info("Chưa huấn luyện hoặc chưa nạp mô hình SVM Baseline.")
+def build_app():
+    with gr.Blocks(title="XLAS · AI Studio") as app:
+        gr.HTML('''<header class="topbar"><div class="brand"><span class="brand-icon">x</span><strong>XLAS<span> / AI STUDIO</span></strong></div><span class="topbar-note">Một góc nhìn, nhiều khám phá.</span></header>
+        <section class="welcome"><div><div class="eyebrow">KHÔNG GIAN SÁNG TẠO VỚI AI</div><h1>Thấy nhiều hơn.<br><span>Hiểu rõ hơn.</span></h1><p>Từ hình ảnh đến lời nói — khám phá, đặt câu hỏi<br class="desktop-break"> và lắng nghe trong một không gian.</p></div><div class="welcome-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="art-tile tile-image">▧</div><div class="art-tile tile-sound">▂ ▅ ▇ ▃ ▆ ▂</div><div class="art-tile tile-spark">✦</div><span class="art-label">IMAGE · VOICE · EXPRESSION</span></div></section>''')
+        with gr.Accordion("Kết nối AI · Nhập API key tại đây", open=False, elem_id="ai-settings"):
+            gr.Markdown("Dùng Gemini hoặc OpenAI cho hỏi đáp và mô tả biểu cảm. Key chỉ dùng trong phiên làm việc; ảnh và câu hỏi được gửi đến nhà cung cấp bạn chọn khi xử lý.")
+            with gr.Row():
+                gemini = gr.Textbox(label="Gemini API key", type="password", placeholder="Nhập Gemini API key…")
+                openai = gr.Textbox(label="OpenAI API key", type="password", placeholder="Nhập OpenAI API key…")
+        providers = ["Gemini AI", "OpenAI GPT-4 Vision", "Demo cục bộ"]
+        with gr.Tabs(elem_id="workspace-tabs"):
+            with gr.Tab("01  Hình ảnh", id="image"):
+                section_heading("IMAGE CAPTIONING", "Một bức ảnh, một câu chuyện.", "Tạo chú thích, khám phá nội dung và nghe ảnh được kể bằng lời.")
+                with gr.Row(equal_height=False, elem_classes="workspace-row"):
+                    with gr.Column(scale=1, min_width=300, elem_classes="studio-panel"):
+                        panel_heading("01", "Ảnh của bạn", "Tải lên, dán ảnh hoặc sử dụng camera")
+                        picture = gr.Image(label="Ảnh đầu vào", show_label=False, type="numpy", sources=["upload", "webcam", "clipboard"], height=300, elem_classes="image-input")
+                        with gr.Accordion("Tùy chỉnh nâng cao", open=False, elem_classes="subtle-accordion"):
+                            beam = gr.Slider(1, 10, value=5, step=1, label="Beam Search Size", info="Số phương án mô hình cân nhắc khi tạo chú thích.")
+                        caption_button = gr.Button("Tạo chú thích  →", variant="primary", size="lg")
+                        clear_image = gr.ClearButton(value="Làm mới", size="sm")
+                        if SAMPLE_IMAGES:
+                            gr.Examples(examples=[[p] for p in SAMPLE_IMAGES], inputs=picture, label="Ảnh mẫu thử nghiệm (data/samples)")
+                    with gr.Column(scale=1, min_width=300, elem_classes="studio-panel result-panel"):
+                        panel_heading("02", "Khám phá kết quả", "Đọc, chỉnh sửa và nghe chú thích của bạn")
+                        with gr.Tabs(elem_classes="result-tabs"):
+                            with gr.Tab("Chú thích"):
+                                caption = gr.Textbox(label="Nội dung chú thích", placeholder="Câu chuyện của bức ảnh sẽ xuất hiện ở đây…", lines=5, interactive=True, buttons=["copy"], elem_classes="result-text")
+                                with gr.Row(elem_classes="playback-row"):
+                                    language = gr.Dropdown(["Tiếng Anh (English)", "Tiếng Việt (Vietnamese)"], value="Tiếng Anh (English)", label="Ngôn ngữ đọc", scale=2, min_width=160)
+                                    speak = gr.Button("Đọc lại", scale=1, min_width=100)
+                                caption_audio = gr.Audio(label="Nghe chú thích", type="filepath", interactive=False)
+                            with gr.Tab("Scene Graph"):
+                                graph_image = gr.Image(label="Các mối quan hệ trong ảnh", height=280, interactive=False)
+                                graph = gr.Markdown("Các mối quan hệ sẽ xuất hiện sau khi xử lý ảnh.")
+                        with gr.Accordion("Chi tiết xử lý", open=False, elem_classes="subtle-accordion"):
+                            info = gr.Markdown("Chưa có kết quả xử lý.")
+                        if backend.MODEL is None and backend.BLIP_MODEL is None:
+                            gr.HTML('<div class="mode-note"><span>i</span> Chế độ mô phỏng · Chưa tải mô hình chú thích ảnh.</div>')
+                image_outputs = [caption, caption_audio, graph_image, graph, info]
+                caption_button.click(backend.generate_caption_from_image, [picture, beam], image_outputs)
+                speak.click(backend.speak_custom_text, [caption, language], caption_audio)
+                clear_image.add([picture, *image_outputs])
+            with gr.Tab("02  Hỏi đáp", id="voice"):
+                section_heading("VOICE Q&A ASSISTANT", "Bạn hỏi. AI cùng khám phá.", "Hỏi về hình ảnh bằng văn bản hoặc giọng nói tiếng Việt, tiếng Anh.")
+                with gr.Row(equal_height=False, elem_classes="workspace-row"):
+                    with gr.Column(scale=1, min_width=300, elem_classes="studio-panel"):
+                        panel_heading("01", "Ảnh & câu hỏi", "Chọn ảnh, rồi đặt điều bạn muốn biết")
+                        qa_image = gr.Image(label="Ảnh để hỏi đáp", show_label=False, type="numpy", sources=["upload", "webcam"], height=240, elem_classes="image-input")
+                        qa_provider = gr.Dropdown(providers, value="Gemini AI", label="Trợ lý AI")
+                        question = gr.Textbox(label="Câu hỏi của bạn", placeholder="Ví dụ: Hãy mô tả những gì có trong ảnh này…", lines=2)
+                        with gr.Accordion("Dùng giọng nói thay cho bàn phím", open=False, elem_classes="subtle-accordion"):
+                            question_audio = gr.Audio(label="Ghi âm hoặc tải câu hỏi", sources=["microphone", "upload"], type="filepath", format="wav")
+                            gr.Markdown("Nếu có ghi âm, trợ lý sẽ ưu tiên câu hỏi trong bản ghi.")
+                        ask = gr.Button("Gửi câu hỏi  →", variant="primary", size="lg")
+                        clear_qa = gr.ClearButton(value="Cuộc hỏi đáp mới", size="sm")
+                        if SAMPLE_IMAGES:
+                            gr.Examples(examples=[[p] for p in SAMPLE_IMAGES[:2]], inputs=qa_image, label="Ảnh mẫu thử nghiệm")
+                    with gr.Column(scale=1, min_width=300, elem_classes="studio-panel result-panel"):
+                        panel_heading("02", "Lời giải đáp", "Thông tin từ hình ảnh, theo câu hỏi của bạn")
+                        answer = gr.Textbox(label="Câu trả lời", placeholder="Chọn một bức ảnh và đặt câu hỏi để bắt đầu cuộc trò chuyện.", lines=10, interactive=False, buttons=["copy"], elem_classes="result-text")
+                        answer_audio = gr.Audio(label="Nghe câu trả lời", type="filepath", interactive=False)
+                        with gr.Accordion("Văn bản nhận diện từ ghi âm", open=False, elem_classes="subtle-accordion"):
+                            transcript = gr.Textbox(label="Câu hỏi đã nghe", interactive=False, lines=2)
+                ask.click(answer_question, [qa_image, question, question_audio, qa_provider, gemini, openai], [transcript, answer, answer_audio])
+                clear_qa.add([qa_image, question, question_audio, transcript, answer, answer_audio])
+            with gr.Tab("03  Khuôn mặt", id="face"):
+                section_heading("FACE EMOTION ANALYZER", "Quan sát từng biểu cảm.", "Phát hiện khuôn mặt và khám phá những biểu cảm nhìn thấy trong ảnh.")
+                with gr.Row(equal_height=False, elem_classes="workspace-row"):
+                    with gr.Column(scale=1, min_width=300, elem_classes="studio-panel"):
+                        panel_heading("01", "Ảnh chân dung", "Ảnh rõ nét, đủ sáng cho kết quả tốt hơn")
+                        face_image = gr.Image(label="Ảnh khuôn mặt", show_label=False, type="numpy", sources=["upload", "webcam"], height=300, elem_classes="image-input")
+                        face_provider = gr.Dropdown(providers, value="Gemini AI", label="AI phân tích")
+                        analyze = gr.Button("Phân tích biểu cảm  →", variant="primary", size="lg")
+                        clear_face = gr.ClearButton(value="Làm mới", size="sm")
+                        if SAMPLE_IMAGES:
+                            gr.Examples(examples=[[p] for p in SAMPLE_IMAGES], inputs=face_image, label="Ảnh mẫu thử nghiệm")
+                    with gr.Column(scale=1, min_width=300, elem_classes="studio-panel result-panel"):
+                        panel_heading("02", "Bức tranh biểu cảm", "Khuôn mặt được phát hiện và mô tả từ AI")
+                        with gr.Tabs(elem_classes="result-tabs"):
+                            with gr.Tab("Phân tích"):
+                                details = gr.Textbox(label="Mô tả biểu cảm", placeholder="Kết quả phân tích sẽ xuất hiện khi bạn gửi ảnh.", lines=7, interactive=False, buttons=["copy"], elem_classes="result-text")
+                                face_audio = gr.Audio(label="Nghe kết quả", type="filepath", interactive=False)
+                            with gr.Tab("Vùng khuôn mặt"):
+                                detected = gr.Image(label="Khuôn mặt được phát hiện", height=300, interactive=False)
+                        gr.HTML('<div class="mode-note"><span>i</span> Biểu cảm là gợi ý, không khẳng định cảm xúc thực tế.</div>')
+                analyze.click(backend.run_face_analyzer, [face_image, face_provider, gemini, openai], [detected, details, face_audio])
+                clear_face.add([face_image, detected, details, face_audio])
+        gr.HTML('<div class="studio-footer"><span><b>XLAS</b> · Designed for discovery</span><span>Hình ảnh · Giọng nói · Biểu cảm</span></div>')
+    return app
 
-# ==========================================
-# TAB 2: PHÂN TÍCH VIDEO
-# ==========================================
-with tab_vid:
-    st.markdown("### Phân tích tính nhất quán theo thời gian trên video")
-    vid_file = st.file_uploader("Tải lên video của bạn (MP4, AVI, MOV)", type=['mp4', 'avi', 'mov'])
-    
-    if vid_file is not None:
-        # Lưu file tạm thời để OpenCV đọc
-        temp_path = "temp_uploaded_video.mp4"
-        with open(temp_path, "wb") as f:
-            f.write(vid_file.read())
-            
-        # Đọc và lấy thông tin video
-        cap = cv2.VideoCapture(temp_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        resolution = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        
-        # Bố cục hiển thị thông tin video
-        col_inf1, col_inf2, col_inf3 = st.columns(3)
-        with col_inf1:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-title">Số lượng Frame</div>
-                <div class="metric-value">{total_frames}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col_inf2:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-title">Tỷ lệ khung hình (FPS)</div>
-                <div class="metric-value">{fps:.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col_inf3:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-title">Độ phân giải</div>
-                <div class="metric-value">{resolution}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        # Trích xuất frames
-        with st.spinner("Đang trích xuất và xử lý 16 frame của video..."):
-            frames = extract_video_frames(temp_path)
-            
-        if len(frames) == 16:
-            st.success("Trích xuất và crop khuôn mặt 16 frame thành công!")
-            
-            # CHẠY SUY LUẬN VIDEO
-            if models_loaded['video'] is not None:
-                # Tiến hành tiền xử lý cho từng frame để đưa vào mạng video
-                transform = get_transforms(split='test')
-                
-                rgb_list = []
-                fft_list = []
-                face_imgs_list = []
-                fft_imgs_list = []
-                
-                for frame in frames:
-                    face_img = detect_and_crop_face(frame)
-                    face_imgs_list.append(face_img)
-                    
-                    fft_arr = compute_fft(face_img)
-                    fft_imgs_list.append(fft_arr)
-                    
-                    face_pil = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
-                    rgb_list.append(transform(face_pil))
-                    fft_list.append(torch.tensor(fft_arr, dtype=torch.float32).unsqueeze(0))
-                    
-                # Stack thành tensor shape: (1, 16, C, H, W)
-                clip_rgb = torch.stack(rgb_list).unsqueeze(0).to(device)
-                clip_fft = torch.stack(fft_list).unsqueeze(0).to(device)
-                
-                with torch.no_grad():
-                    logits, attention_weights = models_loaded['video'](clip_rgb, clip_fft)
-                    
-                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-                fake_prob = probs[1]
-                
-                # Biểu thị kết quả phân loại video
-                st.markdown("---")
-                st.markdown("### 🧠 Kết quả phân tích chuỗi thời gian video")
-                
-                if fake_prob >= threshold:
-                    vid_label = f'<span class="badge-fake">VIDEO GIẢ MẠO (FAKE) - {fake_prob*100:.2f}%</span>'
-                else:
-                    vid_label = f'<span class="badge-real">VIDEO THẬT (REAL) - {(1-fake_prob)*100:.2f}%</span>'
-                    
-                st.markdown(f"<h4>Trạng thái video: {vid_label}</h4>", unsafe_allow_html=True)
-                
-                # Trực quan hóa attention weights theo timeline
-                att_weights_np = attention_weights[0].cpu().numpy().flatten()
-                
-                col_gr1, col_gr2 = st.columns(2)
-                with col_gr1:
-                    # Vẽ timeline attention
-                    fig_att, ax_att = plt.subplots(figsize=(6, 3))
-                    ax_att.plot(range(1, 17), att_weights_np, marker='o', color='#8884d8', linewidth=2)
-                    ax_att.set_xlabel('Frame Index trong Clip')
-                    ax_att.set_ylabel('Attention Weight (Độ nghi vấn)')
-                    ax_att.set_title('Timeline phân phối độ nghi vấn theo thời gian')
-                    ax_att.set_xticks(range(1, 17))
-                    st.pyplot(fig_att, use_container_width=True)
-                    plt.close(fig_att)
-                    
-                with col_gr2:
-                    # Tìm frame có attention cao nhất (đáng ngờ nhất)
-                    suspicious_idx = np.argmax(att_weights_np)
-                    st.markdown(f"**Khung hình đáng ngờ nhất:** Frame thứ **{suspicious_idx+1}** (Attention = {att_weights_np[suspicious_idx]:.4f})")
-                    
-                    # Chạy Grad-CAM cho frame đáng ngờ nhất để giải thích spatial
-                    target_layer = models_loaded['video'].image_encoder.spatial_branch.backbone.features[-1]
-                    grad_cam = GradCAM(models_loaded['video'].image_encoder, target_layer)
-                    
-                    # Chuẩn bị đầu vào cho frame đáng ngờ
-                    rgb_frame_tensor = clip_rgb[:, suspicious_idx].clone()
-                    fft_frame_tensor = clip_fft[:, suspicious_idx].clone()
-                    
-                    rgb_frame_tensor.requires_grad = True
-                    cam_mask_susp, _ = grad_cam(rgb_frame_tensor, fft_frame_tensor)
-                    overlay_susp = generate_cam_overlay(face_imgs_list[suspicious_idx], cam_mask_susp)
-                    
-                    st.image(overlay_susp, caption=f"Vùng bất thường trên khuôn mặt ở Frame {suspicious_idx+1}", use_container_width=True)
-                    grad_cam.remove_hooks()
-                    
-                # Cho phép trượt và xem toàn bộ 16 frame
-                st.markdown("#### 🎞️ Duyệt chi tiết 16 frame đã crop")
-                frame_sel = st.slider("Chọn frame để xem chi tiết", 1, 16, 1) - 1
-                
-                col_fr1, col_fr2 = st.columns(2)
-                with col_fr1:
-                    st.image(cv2.cvtColor(face_imgs_list[frame_sel], cv2.COLOR_BGR2RGB), caption=f"Frame {frame_sel+1} khuôn mặt", use_container_width=True)
-                with col_fr2:
-                    fig_fft_sel, ax_fft_sel = plt.subplots(figsize=(4, 4))
-                    ax_fft_sel.imshow(fft_imgs_list[frame_sel], cmap='gray')
-                    ax_fft_sel.axis('off')
-                    st.pyplot(fig_fft_sel, use_container_width=True)
-                    plt.close(fig_fft_sel)
-                    st.markdown("<p style='text-align: center; color: #b3b3b3; font-size: 0.8rem;'>Phổ FFT tương ứng</p>", unsafe_allow_html=True)
-                    
-            else:
-                st.warning("⚠️ Chưa nạp mô hình video (BiGRU). Vui lòng chạy huấn luyện mô hình video trước.")
-        else:
-            st.error("Không thể trích xuất đủ 16 frame từ video này.")
-            
-        # Xóa file tạm
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+
+def main():
+    parser = argparse.ArgumentParser(description="XLAS AI Studio")
+    parser.add_argument("--checkpoint", default="auto")
+    parser.add_argument("--config", default="configs/base_config.yaml")
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--sg_method", choices=["heuristic", "reltr"], default="heuristic")
+    parser.add_argument("--port", type=int, default=7861)
+    parser.add_argument("--lightweight", action="store_true", help="Bỏ qua tải mô hình; caption chỉ mô phỏng.")
+    args = parser.parse_args()
+    os.chdir(ROOT)
+    if not args.lightweight:
+        backend.load_model_global(args.checkpoint, args.config, args.sg_method, args.gpu)
+    build_app().queue(default_concurrency_limit=1).launch(
+        server_name="127.0.0.1", server_port=args.port, theme=make_theme(), css=CSS,
+        inbrowser=False, show_error=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
